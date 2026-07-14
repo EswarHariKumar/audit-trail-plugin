@@ -6,6 +6,7 @@ import hudson.Util;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZonedDateTime;
 import java.util.Collection;
@@ -67,6 +68,37 @@ public class LogFileDailyRotationAuditLoggerTest {
         String log = Util.loadFile(logFileRotating.toFile(), StandardCharsets.UTF_8);
         Assert.assertTrue(log.contains("configuringAFileLoggerRotatingDaily - line1"));
         Assert.assertTrue(log.contains("configuringAFileLoggerRotatingDaily - line2"));
+    }
+
+    /**
+     * Restarting should use today's deterministic file name without scanning old files.
+     */
+    @Test
+    public void logFileStartsAtCurrentDayWithoutScanningOldFiles() throws IOException {
+        ZonedDateTime today = ZonedDateTime.now();
+        ZonedDateTime previousDay = today.minusDays(1);
+
+        try (MockedStatic<ZonedDateTime> mockedLocalDateTime = Mockito.mockStatic(
+                ZonedDateTime.class, Mockito.withSettings().defaultAnswer(Answers.CALLS_REAL_METHODS))) {
+            mockedLocalDateTime.when(ZonedDateTime::now).thenReturn(previousDay);
+            Path logFile = folder.getRoot().toPath().resolve("file");
+            LogFileDailyRotationAuditLogger previousLogger =
+                    new LogFileDailyRotationAuditLogger(logFile.toString(), 1, null);
+            previousLogger.log("previous day");
+            previousLogger.cleanUp();
+            Path previousLogFile = folder.getRoot().toPath().resolve(previousLogger.computePattern());
+            Assert.assertTrue(previousLogFile.toFile().exists());
+
+            mockedLocalDateTime.when(ZonedDateTime::now).thenReturn(today);
+            LogFileDailyRotationAuditLogger todayLogger =
+                    new LogFileDailyRotationAuditLogger(logFile.toString(), 1, null);
+            todayLogger.log("today");
+            Path todayLogFile = folder.getRoot().toPath().resolve(todayLogger.computePattern());
+
+            Assert.assertNotEquals(previousLogFile, todayLogFile);
+            Assert.assertTrue(todayLogFile.toFile().exists());
+            Assert.assertTrue(Util.loadFile(todayLogFile.toFile(), StandardCharsets.UTF_8).contains("today"));
+        }
     }
 
     /**
@@ -175,6 +207,35 @@ public class LogFileDailyRotationAuditLoggerTest {
                             + LogFileDailyRotationAuditLogger.DAILY_ROTATING_FILE_REGEX_PATTERN),
                     DirectoryFileFilter.DIRECTORY);
             Assert.assertEquals(directoryFiles.size(), 2);
+        }
+    }
+
+    /**
+     * Cleanup should only inspect the configured log directory, not recursively walk children.
+     */
+    @Test
+    public void oldLogFilesInSubdirectoriesAreNotRemovedWithDailyRotation() throws IOException {
+        // test seems to be flaky on Windows, let's skip it for now I have no Windows machine to debug
+        assumeTrue(!System.getProperty("os.name").toLowerCase().contains("windows"));
+        ZonedDateTime zonedDateTime1 = ZonedDateTime.now();
+        ZonedDateTime zonedDateTime2 = zonedDateTime1.plusDays(1);
+
+        try (MockedStatic<ZonedDateTime> mockedLocalDateTime = Mockito.mockStatic(
+                ZonedDateTime.class, Mockito.withSettings().defaultAnswer(Answers.CALLS_REAL_METHODS))) {
+            mockedLocalDateTime.when(ZonedDateTime::now).thenReturn(zonedDateTime1);
+            Path logFile = folder.getRoot().toPath().resolve("file");
+            LogFileDailyRotationAuditLogger logFileAuditLogger =
+                    new LogFileDailyRotationAuditLogger(logFile.toString(), 1, null);
+            logFileAuditLogger.log("first day");
+
+            Path nestedLog = folder.getRoot().toPath().resolve("nested").resolve("file-2000-01-01");
+            Files.createDirectories(nestedLog.getParent());
+            Files.writeString(nestedLog, "nested");
+
+            mockedLocalDateTime.when(ZonedDateTime::now).thenReturn(zonedDateTime2);
+            logFileAuditLogger.log("second day");
+
+            Assert.assertTrue(nestedLog.toFile().exists());
         }
     }
 }
