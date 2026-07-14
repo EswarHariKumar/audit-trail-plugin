@@ -1,31 +1,25 @@
 package hudson.plugins.audit_trail;
 
-import static org.apache.commons.io.comparator.LastModifiedFileComparator.LASTMODIFIED_REVERSE;
-
 import hudson.Extension;
 import hudson.model.Descriptor;
-import java.io.File;
 import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
-import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.util.Collection;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.logging.FileHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
-import org.apache.commons.io.filefilter.DirectoryFileFilter;
-import org.apache.commons.io.filefilter.RegexFileFilter;
 import org.kohsuke.stapler.DataBoundConstructor;
 
 public class LogFileDailyRotationAuditLogger extends AbstractLogFileAuditLogger {
@@ -60,40 +54,15 @@ public class LogFileDailyRotationAuditLogger extends AbstractLogFileAuditLogger 
     }
 
     /**
-     * Initializes initInstant to the instant obtained from the latest daily
-     * log file saved on disk (if present), or if not present, to the current instant.
+     * Initializes the logger to today's deterministic file name.
+     *
+     * Older versions recursively scanned the log directory to find the latest daily
+     * file on disk. That made Jenkins startup depend on the size and latency of the
+     * log filesystem. Since the daily file name is derived from today's date, a
+     * restart during the same day will still append to the same file without scanning.
      */
     private void initializeDailyRotation() {
-        Path directoryPath = basePattern.getParent();
-        boolean directoryExists = false;
-        if (directoryPath != null) {
-            directoryExists = directoryPath.toFile().exists();
-        }
-
-        if (directoryExists) {
-            // audit-log.log-2022-10-19-15-50.0
-            Collection<File> files = FileUtils.listFiles(
-                    new File(directoryPath.toString()),
-                    new RegexFileFilter(
-                            ".*" + FilenameUtils.getName(basePattern.toString()) + DAILY_ROTATING_FILE_REGEX_PATTERN),
-                    DirectoryFileFilter.DIRECTORY);
-            if (files.size() > 0) {
-                List<File> orderedList =
-                        files.stream().sorted(LASTMODIFIED_REVERSE).collect(Collectors.toList());
-                File lastFile = orderedList.get(0);
-                Matcher matcher = Pattern.compile("[0-9]{4}-[0-9]{2}-[0-9]{2}").matcher(lastFile.getName());
-                if (matcher.find()) {
-                    // Initialize initInstant with the date saved on the audit file name
-                    // See example https://stackoverflow.com/questions/14385834/java-regex-group-0
-                    initInstant =
-                            Instant.parse(matcher.group(0) + "T00:00:00.00Z").atZone(ZoneId.systemDefault());
-                }
-            }
-        }
-        // Initialize initInstant to the current instant
-        if (initInstant == null) {
-            initInstant = ZonedDateTime.now().truncatedTo(ChronoUnit.DAYS);
-        }
+        initInstant = ZonedDateTime.now().truncatedTo(ChronoUnit.DAYS);
         configure();
     }
 
@@ -129,21 +98,53 @@ public class LogFileDailyRotationAuditLogger extends AbstractLogFileAuditLogger 
     private void removeOldFiles() {
         Path directoryPath = basePattern.getParent();
         if (directoryPath != null) {
-            Collection<File> files = FileUtils.listFiles(
-                    directoryPath.toFile(),
-                    new RegexFileFilter(
-                            ".*" + FilenameUtils.getName(basePattern.toString()) + DAILY_ROTATING_FILE_REGEX_PATTERN),
-                    DirectoryFileFilter.DIRECTORY);
-            if (files.size() > getCount()) {
-                List<File> orderedList =
-                        files.stream().sorted(LASTMODIFIED_REVERSE).collect(Collectors.toList());
-                List<File> toDelete = orderedList.subList(getCount(), orderedList.size());
-                for (File file : toDelete) {
-                    if (!file.delete()) {
-                        LOGGER.log(Level.SEVERE, "File {0} could not be removed on rotate overation", file.getName());
+            try {
+                List<Path> files = listDailyRotationFiles(directoryPath);
+                if (files.size() > getCount()) {
+                    files.sort(Comparator.comparing(this::lastModifiedMillis).reversed());
+                    List<Path> toDelete = files.subList(getCount(), files.size());
+                    for (Path file : toDelete) {
+                        try {
+                            Files.deleteIfExists(file);
+                        } catch (IOException e) {
+                            LOGGER.log(
+                                    Level.SEVERE,
+                                    "File " + file.getFileName() + " could not be removed on rotate operation",
+                                    e);
+                        }
                     }
                 }
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Could not inspect daily rotation files for cleanup", e);
             }
+        }
+    }
+
+    private List<Path> listDailyRotationFiles(Path directoryPath) throws IOException {
+        List<Path> files = new ArrayList<>();
+        if (!Files.isDirectory(directoryPath)) {
+            return files;
+        }
+
+        Pattern fileNamePattern = Pattern.compile(
+                ".*" + Pattern.quote(FilenameUtils.getName(basePattern.toString())) + DAILY_ROTATING_FILE_REGEX_PATTERN);
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directoryPath)) {
+            for (Path path : stream) {
+                if (Files.isRegularFile(path)
+                        && fileNamePattern.matcher(path.getFileName().toString()).matches()) {
+                    files.add(path);
+                }
+            }
+        }
+        return files;
+    }
+
+    private long lastModifiedMillis(Path path) {
+        try {
+            return Files.getLastModifiedTime(path).toMillis();
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "Could not read last modified time for " + path, e);
+            return 0L;
         }
     }
 
